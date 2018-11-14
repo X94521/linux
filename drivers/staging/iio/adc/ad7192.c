@@ -6,6 +6,7 @@
  * Licensed under the GPL-2.
  */
 
+#include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
@@ -25,8 +26,6 @@
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/adc/ad_sigma_delta.h>
-
-#include "ad7192.h"
 
 /* Registers */
 #define AD7192_REG_COMM		0 /* Communications Register (WO, 8-bit) */
@@ -157,14 +156,23 @@
 struct ad7192_state {
 	struct regulator		*avdd;
 	struct regulator		*dvdd;
+	struct clk			*mclk;
 	u16				int_vref_mv;
-	u32				mclk;
+	u32				freq;
 	u32				f_order;
 	u32				mode;
 	u32				conf;
 	u32				scale_avail[8][2];
 	u8				gpocon;
 	u8				devid;
+	u8				clock_sel;
+	bool				refin2_en;
+	bool				rej60_en;
+	bool				sinc3_en;
+	bool				chop_en;
+	bool				buf_en;
+	bool				unipolar_en;
+	bool				burnout_curr_en;
 
 	struct ad_sigma_delta		sd;
 };
@@ -227,11 +235,11 @@ static inline bool ad7192_valid_external_frequency(u32 freq)
 		freq <= AD7192_EXT_FREQ_MHZ_MAX);
 }
 
-static int ad7192_setup(struct ad7192_state *st,
-			const struct ad7192_platform_data *pdata)
+static int ad7192_setup(struct ad7192_state *st)
 {
 	struct iio_dev *indio_dev = spi_get_drvdata(st->sd.spi);
 	unsigned long long scale_uv;
+	unsigned int fclk;
 	int i, ret, id;
 
 	/* reset the serial interface */
@@ -251,19 +259,31 @@ static int ad7192_setup(struct ad7192_state *st,
 		dev_warn(&st->sd.spi->dev, "device ID query failed (0x%X)\n",
 			 id);
 
-	switch (pdata->clock_source_sel) {
+	switch (st->clock_sel) {
 	case AD7192_CLK_INT:
 	case AD7192_CLK_INT_CO:
-		st->mclk = AD7192_INT_FREQ_MHZ;
+		st->freq = AD7192_INT_FREQ_MHZ;
 		break;
 	case AD7192_CLK_EXT_MCLK1_2:
 	case AD7192_CLK_EXT_MCLK2:
-		if (ad7192_valid_external_frequency(pdata->ext_clk_hz)) {
-			st->mclk = pdata->ext_clk_hz;
+		ret = clk_prepare_enable(st->mclk);
+		if (ret < 0) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		fclk = clk_get_rate(st->mclk);
+		if (!fclk) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (ad7192_valid_external_frequency(fclk)) {
+			st->freq = fclk;
 			break;
 		}
 		dev_err(&st->sd.spi->dev, "Invalid frequency setting %u\n",
-			pdata->ext_clk_hz);
+			fclk);
 		ret = -EINVAL;
 		goto out;
 	default:
@@ -272,23 +292,23 @@ static int ad7192_setup(struct ad7192_state *st,
 	}
 
 	st->mode = AD7192_MODE_SEL(AD7192_MODE_IDLE) |
-		AD7192_MODE_CLKSRC(pdata->clock_source_sel) |
+		AD7192_MODE_CLKSRC(st->clock_sel) |
 		AD7192_MODE_RATE(480);
 
 	st->conf = AD7192_CONF_GAIN(0);
 
-	if (pdata->rej60_en)
+	if (st->rej60_en)
 		st->mode |= AD7192_MODE_REJ60;
 
-	if (pdata->sinc3_en)
+	if (st->sinc3_en)
 		st->mode |= AD7192_MODE_SINC3;
 
-	if (pdata->refin2_en && (st->devid != ID_AD7195))
+	if (st->refin2_en && (st->devid != ID_AD7195))
 		st->conf |= AD7192_CONF_REFSEL;
 
-	if (pdata->chop_en) {
+	if (st->chop_en) {
 		st->conf |= AD7192_CONF_CHOP;
-		if (pdata->sinc3_en)
+		if (st->sinc3_en)
 			st->f_order = 3; /* SINC 3rd order */
 		else
 			st->f_order = 4; /* SINC 4th order */
@@ -296,13 +316,13 @@ static int ad7192_setup(struct ad7192_state *st,
 		st->f_order = 1;
 	}
 
-	if (pdata->buf_en)
+	if (st->buf_en)
 		st->conf |= AD7192_CONF_BUF;
 
-	if (pdata->unipolar_en)
+	if (st->unipolar_en)
 		st->conf |= AD7192_CONF_UNIPOLAR;
 
-	if (pdata->burnout_curr_en)
+	if (st->burnout_curr_en)
 		st->conf |= AD7192_CONF_BURN;
 
 	ret = ad_sd_write_reg(&st->sd, AD7192_REG_MODE, 3, st->mode);
@@ -330,6 +350,7 @@ static int ad7192_setup(struct ad7192_state *st,
 
 	return 0;
 out:
+	clk_disable_unprepare(st->mclk);
 	dev_err(&st->sd.spi->dev, "setup failed\n");
 	return ret;
 }
@@ -496,7 +517,7 @@ static int ad7192_read_raw(struct iio_dev *indio_dev,
 			*val -= 273 * ad7192_get_temp_scale(unipolar);
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		*val = st->mclk /
+		*val = st->freq /
 			(st->f_order * 1024 * AD7192_MODE_RATE(st->mode));
 		return IIO_VAL_INT;
 	}
@@ -541,7 +562,7 @@ static int ad7192_write_raw(struct iio_dev *indio_dev,
 			break;
 		}
 
-		div = st->mclk / (val * st->f_order * 1024);
+		div = st->freq / (val * st->f_order * 1024);
 		if (div < 1 || div > 1023) {
 			ret = -EINVAL;
 			break;
@@ -622,62 +643,37 @@ static const struct iio_chan_spec ad7193_channels[] = {
 	IIO_CHAN_SOFT_TIMESTAMP(14),
 };
 
-static int ad7192_parse_dt(struct device_node *np,
-               struct ad7192_platform_data *pdata)
+static void ad7192_parse_dt(struct device_node *np,
+               struct ad7192_state *st)
 {
-	of_property_read_u16(np, "adi,reference-voltage-mv", &pdata->vref_mv);
-	of_property_read_u8(np, "adi,clock-source-select", &pdata->clock_source_sel);
-	of_property_read_u32(np, "adi,external-clock-Hz", &pdata->ext_clk_hz);
-	pdata->refin2_en = of_property_read_bool(np, "adi,refin2-pins-enable");
-	pdata->rej60_en = of_property_read_bool(np, "adi,rejection-60-Hz-enable");
-	pdata->sinc3_en = of_property_read_bool(np, "adi,sinc3-filter-enable");
-	pdata->chop_en = of_property_read_bool(np, "adi,chop-enable");
-	pdata->buf_en = of_property_read_bool(np, "adi,buffer-enable");
-	pdata->unipolar_en = of_property_read_bool(np, "adi,unipolar-enable");
-	pdata->burnout_curr_en = of_property_read_bool(np, "adi,burnout-currents-enable");
-
-	return 0;
+	st->refin2_en = of_property_read_bool(np, "adi,refin2-pins-enable");
+	st->rej60_en = of_property_read_bool(np, "adi,rejection-60-Hz-enable");
+	st->sinc3_en = of_property_read_bool(np, "adi,sinc3-filter-enable");
+	st->chop_en = of_property_read_bool(np, "adi,chop-enable");
+	st->buf_en = of_property_read_bool(np, "adi,buffer-enable");
+	st->unipolar_en = of_property_read_bool(np, "adi,unipolar-enable");
+	st->burnout_curr_en = of_property_read_bool(np, "adi,burnout-currents-enable");
 }
 
 static int ad7192_probe(struct spi_device *spi)
 {
-	struct ad7192_platform_data *pdata;
 	struct ad7192_state *st;
 	struct iio_dev *indio_dev;
 	int ret, voltage_uv = 0;
-
-	pdata = devm_kzalloc(&spi->dev, sizeof(struct ad7192_platform_data),
-				GFP_KERNEL);
-	if (!pdata) {
-		return -ENOMEM;
-	}
-	if(spi->dev.platform_data) {
-		pdata = spi->dev.platform_data;
-	}
-	else {
-		if (spi->dev.of_node) {
-			ret = ad7192_parse_dt(spi->dev.of_node, pdata);
-			if (ret) {
-				dev_err(&spi->dev, "no platform data?\n");
-				return -ENODEV;
-			}
-		}
-		else {
-			dev_err(&spi->dev, "no platform data?\n");
-			return -ENODEV;
-		}
-	}
-
-	if (!spi->irq) {
-		dev_err(&spi->dev, "no IRQ?\n");
-		return -ENODEV;
-	}
 
 	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
 	if (!indio_dev)
 		return -ENOMEM;
 
 	st = iio_priv(indio_dev);
+
+	/* Parse optional device tree options */
+	ad7192_parse_dt(spi->dev.of_node, st);
+
+	if (!spi->irq) {
+		dev_err(&spi->dev, "no IRQ?\n");
+		return -ENODEV;
+	}
 
 	st->avdd = devm_regulator_get(&spi->dev, "avdd");
 	if (IS_ERR(st->avdd))
@@ -701,11 +697,21 @@ static int ad7192_probe(struct spi_device *spi)
 		goto error_disable_avdd;
 	}
 
+	st->clock_sel = AD7192_CLK_EXT_MCLK2;
+	st->mclk = devm_clk_get(&spi->dev, "clk");
+	if (IS_ERR(st->mclk)) {
+		/* try xtal option */
+		st->mclk = devm_clk_get(&spi->dev, "xtal");
+		st->clock_sel = AD7192_CLK_EXT_MCLK1_2;
+
+		if (IS_ERR(st->mclk))
+			/* use internal clock */
+			st->clock_sel = AD7192_CLK_INT;
+	}
+
 	voltage_uv = regulator_get_voltage(st->avdd);
 
-	if (pdata->vref_mv)
-		st->int_vref_mv = pdata->vref_mv;
-	else if (voltage_uv)
+	if (voltage_uv)
 		st->int_vref_mv = voltage_uv / 1000;
 	else
 		dev_warn(&spi->dev, "reference voltage undefined\n");
@@ -738,7 +744,7 @@ static int ad7192_probe(struct spi_device *spi)
 	if (ret)
 		goto error_disable_dvdd;
 
-	ret = ad7192_setup(st, pdata);
+	ret = ad7192_setup(st);
 	if (ret)
 		goto error_remove_trigger;
 
